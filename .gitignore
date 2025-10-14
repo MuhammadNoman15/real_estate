@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Environment
+.env
+venv/
+
+# Byte-compiled / optimized / DLL files
+*.pyc
+*.pyo
+*.pyd
+
+# Distribution / packaging
+.Python
+env/
+build/
+dist/
+
+# Misc
+.DS_Store
+.idea/
+.vscode/
+*.log
+*.sqlite3
