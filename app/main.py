@@ -9,15 +9,18 @@ import requests
 from geopy.distance import geodesic
 import csv
 from datetime import date
+import openai  # Import the OpenAI library
+import re  # Import the re module for regex
 
 load_dotenv()
 
 GEOCODING_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
 PLACES_API_KEY = os.getenv("NEXT_PUBLIC_GOOGLE_PLACES_API_KEY")
-
+openai.api_key = os.getenv("OPENAI_API_KEY")
 # Debug print (mask key for safety)
 print("GEOCODING_API_KEY loaded:", bool(GEOCODING_API_KEY))
 print("PLACES_API_KEY loaded:", bool(PLACES_API_KEY))
+print("OPENAI_API_KEY loaded:", bool(openai.api_key))
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -332,3 +335,164 @@ def get_nearby_places(lat, lng, api_key, place_type, radius=1500, keyword=None):
         if data['status'] == 'OK':
             return data['results']
     return []
+
+# Load OpenAI API key securely from .env file or environment
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
+@app.post("/chat")
+async def chat_with_ai(query: dict):
+    user_query = query.get("query")
+
+    if not user_query:
+        raise HTTPException(status_code=400, detail="No query provided")
+
+    # Determine the API action based on the user query
+    api_response = await determine_api_action(user_query)
+
+    return api_response
+
+async def determine_api_action(user_query: str):
+    try:
+        from openai import OpenAI
+        client = OpenAI()  # uses the OPENAI_API_KEY from env
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an intelligent assistant that maps natural language queries "
+                        "to API endpoints for a real estate assistant app. "
+                        "Available actions: nearby schools, nearby transits, nearby parks, "
+                        "zoning info, assessment value, demographics, listings, etc."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"User query: {user_query}\nDetermine the appropriate action:",
+                },
+            ],
+            max_tokens=50,
+        )
+
+        # Correct object-style access
+        action = response.choices[0].message.content.strip().lower()
+
+        # Await the address extraction
+        address = await extract_address_from_query(user_query)
+
+        # Use the extracted address
+        if "school" in user_query:  # Example matching
+            return await nearby_schools(AddressQuery(address=address))
+        elif "transit" in action or "bus" in action or "skytrain" in action:
+            return await nearest_transit(AddressQuery(address=address))
+        elif "park" in action or "trail" in action:
+            return await nearby_parks_and_centres(AddressQuery(address=address))
+        elif "assessment" in action:
+            return await get_bc_assessment(AddressQuery(address=address))
+        # Implement other mappings as needed
+        else:
+            return {"message": "Unable to determine action", "query": user_query}
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def call_nearby_schools_endpoint(query: str):
+    # Extract the address from the query and call the /nearby-schools endpoint
+    address = extract_address_from_query(query)
+    if not address:
+        return {"message": "Unable to extract address from query"}
+
+    # Normally call your existing endpoint logic here
+    response = nearby_schools(AddressQuery(address=address))
+    return response
+
+def call_nearby_transit_endpoint(query: str):
+    address = extract_address_from_query(query)
+    if not address:
+        return {"message": "Unable to extract address from query"}
+    response = nearest_transit(AddressQuery(address=address))
+    return response
+
+def call_nearby_parks_and_centres_endpoint(query: str):
+    address = extract_address_from_query(query)
+    if not address:
+        return {"message": "Unable to extract address from query"}
+    response = nearby_parks_and_centres(AddressQuery(address=address))
+    return response
+
+def call_bc_assessment(query: str):
+    address = extract_address_from_query(query)
+    if not address:
+        return {"message": "Unable to extract address from query"}
+    response = get_bc_assessment(AddressQuery(address=address))
+    return response
+
+def call_zoning_info(query: str):
+    # Placeholder for zoning info endpoint
+    return {"message": "Zoning info endpoint stub", "query": query}
+
+def call_demographic_profile(query: str):
+    # Placeholder for demographic profile endpoint
+    return {"message": "Demographic profile endpoint stub", "query": query}
+
+def call_homes_listing(query: str):
+    # Placeholder for a home listings call, implement as needed
+    return {"message": "Call to homes listing API based on parsed data"}
+
+def regex_extract_address(query: str) -> str:
+    street_pattern = re.compile(
+        r'\b\d{1,5}\s+[A-Za-z0-9]+(?:\s[A-Za-z0-9]+){0,4}\b(?:\s(?:St|Street|Avenue|Ave|Rd|Road|Blvd|Boulevard|Lane|Ln|Drive|Dr|Court|Ct|Way))?',
+        re.IGNORECASE
+    )
+    match = street_pattern.search(query)
+    if match:
+        return match.group(0)
+
+    postal_pattern = re.compile(r'\b[ABCEGHJKLMNPRSTVXY]\d[ABCEGHJKLMNPRSTVWXYZ][ -]?\d[ABCEGHJKLMNPRSTVWXYZ]\d\b', re.IGNORECASE)
+    match = postal_pattern.search(query)
+    if match:
+        return match.group(0)
+
+    for city in BC_CITIES:
+        if city.lower() in query.lower():
+            return city
+
+    intersection_pattern = re.compile(r'\b([A-Za-z0-9]+)\s*&\s*([A-Za-z0-9]+)\b')
+    match = intersection_pattern.search(query)
+    if match:
+        return match.group(0)
+
+    return ""
+
+async def llm_extract_address(query: str) -> str:
+    prompt = (
+        "You are a real estate assistant. Extract only the property address, "
+        "street, city, or postal code from the following user query. "
+        "Do not add any extra text, explanation, or punctuation:\n\n"
+        f"User query: {query}\nAddress:"
+    )
+
+    response = openai.ChatCompletion.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=30
+    )
+
+    address = response.choices[0].message.content.strip()
+    return address
+
+async def extract_address_from_query(query: str) -> str:
+    address = regex_extract_address(query)
+    if address:
+        return address
+
+    address = await llm_extract_address(query)
+    return address
+
+BC_CITIES = [
+    "Vancouver", "West Vancouver", "North Vancouver", "Burnaby",
+    "Richmond", "Surrey", "Coquitlam", "Delta", "Langley"
+]
