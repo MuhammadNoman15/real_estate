@@ -1,43 +1,45 @@
 import os
 from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
-from .db import get_db, User
+from .db import get_db, User, TokenBlacklist
 from pydantic import BaseModel
 from passlib.context import CryptContext
 from dotenv import load_dotenv
 import requests
 from geopy.distance import geodesic
 import csv
-from datetime import date
+from datetime import date, datetime, timedelta
 import openai  # Import the OpenAI library
 import re  # Import the re module for regex
+from jose import JWTError, jwt
+from typing import Optional
 
 load_dotenv()
 
+# API Keys
 GEOCODING_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
 PLACES_API_KEY = os.getenv("NEXT_PUBLIC_GOOGLE_PLACES_API_KEY")
 openai.api_key = os.getenv("OPENAI_API_KEY")
+
+# JWT Configuration
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-secret-key-change-this")
+JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+JWT_ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
+
 # Debug print (mask key for safety)
 print("GEOCODING_API_KEY loaded:", bool(GEOCODING_API_KEY))
 print("PLACES_API_KEY loaded:", bool(PLACES_API_KEY))
 print("OPENAI_API_KEY loaded:", bool(openai.api_key))
+print("JWT_SECRET_KEY loaded:", bool(JWT_SECRET_KEY))
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+security = HTTPBearer()
 
 app = FastAPI(title="Real Estate Search MVP")
 
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-
-@app.post("/query")
-def query_router(payload: dict):
-    # Placeholder: will implement deterministic parsing and SQL calls
-    return {"message": "Query endpoint stub", "input": payload}
-
-
+# ============= PYDANTIC MODELS =============
 class UserCreate(BaseModel):
     username: str
     email: str
@@ -48,13 +50,96 @@ class UserLogin(BaseModel):
     email: str
     password: str
 
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+    user: dict
 
+class TokenData(BaseModel):
+    email: Optional[str] = None
+
+
+# ============= PASSWORD UTILITIES =============
 def get_password_hash(password):
     return pwd_context.hash(password[:72])
 
 
 def verify_password(plain_password, hashed_password):
     return pwd_context.verify(plain_password, hashed_password)
+
+
+# ============= JWT UTILITIES =============
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    """Create a JWT access token"""
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=JWT_ACCESS_TOKEN_EXPIRE_MINUTES)
+    
+    to_encode.update({"exp": expire, "iat": datetime.utcnow()})
+    encoded_jwt = jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+    return encoded_jwt
+
+
+def verify_token(token: str, db: Session) -> Optional[dict]:
+    """Verify JWT token and check if it's blacklisted"""
+    try:
+        # Check if token is blacklisted
+        blacklisted = db.query(TokenBlacklist).filter(TokenBlacklist.token == token).first()
+        if blacklisted:
+            return None
+        
+        # Decode and verify token
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None:
+            return None
+        return payload
+    except JWTError:
+        return None
+
+
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db)
+) -> User:
+    """Dependency to get current authenticated user"""
+    token = credentials.credentials
+    
+    payload = verify_token(token, db)
+    if payload is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    email = payload.get("sub")
+    user = db.query(User).filter(User.email == email).first()
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User not found",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    return user
+
+
+# ============= ENDPOINTS =============
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/query")
+def query_router(
+    payload: dict,
+    current_user: User = Depends(get_current_user)
+):
+    # Placeholder: will implement deterministic parsing and SQL calls
+    return {"message": "Query endpoint stub", "input": payload}
 
 
 @app.post("/register")
@@ -75,21 +160,83 @@ async def register(user: UserCreate, db: Session = Depends(get_db)):
     return {"message": "User registered successfully"}
 
 
-@app.post("/login")
+@app.post("/login", response_model=Token)
 async def login(user: UserLogin, db: Session = Depends(get_db)):
+    """Login endpoint - returns JWT token"""
     db_user = db.query(User).filter(User.email == user.email).first()
     if not db_user:
-        raise HTTPException(status_code=400, detail="Invalid email or password")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     if not verify_password(user.password, db_user.hashed_password):
-        raise HTTPException(status_code=400, detail="Invalid email or password")
-    return {"message": "Login successful"}
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    # Create access token
+    access_token_expires = timedelta(minutes=JWT_ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": db_user.email, "user_id": db_user.id},
+        expires_delta=access_token_expires
+    )
+    
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": {
+            "id": db_user.id,
+            "username": db_user.username,
+            "email": db_user.email
+        }
+    }
+
+
+@app.post("/logout")
+async def logout(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db)
+):
+    """Logout endpoint - blacklists the JWT token"""
+    token = credentials.credentials
+    
+    # Verify token first
+    payload = verify_token(token, db)
+    if payload is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token"
+        )
+    
+    # Get token expiration
+    exp_timestamp = payload.get("exp")
+    expires_at = datetime.fromtimestamp(exp_timestamp)
+    
+    # Add token to blacklist
+    blacklisted_token = TokenBlacklist(
+        token=token,
+        expires_at=expires_at
+    )
+    db.add(blacklisted_token)
+    db.commit()
+    
+    return {"message": "Successfully logged out"}
+
+
+
 
 
 class AddressQuery(BaseModel):
     address: str
 
 @app.post("/assessment")
-async def get_bc_assessment(query: AddressQuery):
+async def get_bc_assessment(
+    query: AddressQuery,
+    current_user: User = Depends(get_current_user)
+):
     address = query.address
     geocoding_data = get_geocoding_data(address, GEOCODING_API_KEY)
     if geocoding_data:
@@ -157,7 +304,10 @@ def get_nearby_schools(lat, lng, api_key, radius=1000):
     return []
 
 @app.post("/nearby-schools")
-async def nearby_schools(query: AddressQuery):
+async def nearby_schools(
+    query: AddressQuery,
+    current_user: User = Depends(get_current_user)
+):
     address = query.address
     geocoding_data = get_geocoding_data(address, GEOCODING_API_KEY)
     if geocoding_data:
@@ -178,7 +328,10 @@ async def nearby_schools(query: AddressQuery):
     raise HTTPException(status_code=404, detail="Unable to retrieve nearby schools.")
 
 @app.post("/school-catchment")
-async def school_catchment(query: AddressQuery):
+async def school_catchment(
+    query: AddressQuery,
+    current_user: User = Depends(get_current_user)
+):
     address = query.address
     geocoding_data = get_geocoding_data(address, GEOCODING_API_KEY)
     if geocoding_data:
@@ -237,7 +390,10 @@ def get_nearby_transit_stations(lat, lng, api_key, radius=1000):
     return []
 
 @app.post("/nearest-transit")
-async def nearest_transit(query: AddressQuery):
+async def nearest_transit(
+    query: AddressQuery,
+    current_user: User = Depends(get_current_user)
+):
     address = query.address
     geocoding_data = get_geocoding_data(address, GEOCODING_API_KEY)
     if geocoding_data:
@@ -260,7 +416,10 @@ async def nearest_transit(query: AddressQuery):
     raise HTTPException(status_code=404, detail="Unable to retrieve transit stations.")
 
 @app.post("/nearby-parks-and-centres")
-async def nearby_parks_and_centres(query: AddressQuery):
+async def nearby_parks_and_centres(
+    query: AddressQuery,
+    current_user: User = Depends(get_current_user)
+):
     address = query.address
     geocoding_data = get_geocoding_data(address, GEOCODING_API_KEY)
     if geocoding_data:
@@ -340,7 +499,10 @@ def get_nearby_places(lat, lng, api_key, place_type, radius=1500, keyword=None):
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
 @app.post("/chat")
-async def chat_with_ai(query: dict):
+async def chat_with_ai(
+    query: dict,
+    current_user: User = Depends(get_current_user)
+):
     user_query = query.get("query")
 
     if not user_query:
@@ -354,6 +516,7 @@ async def chat_with_ai(query: dict):
 async def determine_api_action(user_query: str):
     try:
         from openai import OpenAI
+        import json
         client = OpenAI()  # uses the OPENAI_API_KEY from env
 
         response = client.chat.completions.create(
@@ -363,37 +526,56 @@ async def determine_api_action(user_query: str):
                     "role": "system",
                     "content": (
                         "You are an intelligent assistant that maps natural language queries "
-                        "to API endpoints for a real estate assistant app. "
-                        "Available actions: nearby schools, nearby transits, nearby parks, "
-                        "zoning info, assessment value, demographics, listings, etc."
+                        "to API endpoints for a real estate assistant app.\n\n"
+                        "Available endpoints:\n"
+                        "- 'schools': For nearby schools queries\n"
+                        "- 'school_catchment': For school catchment area queries\n"
+                        "- 'transit': For nearby transit, bus stops, skytrain stations\n"
+                        "- 'parks': For nearby parks, community centres, trails, recreation\n"
+                        "- 'assessment': For BC assessment value, property value queries\n"
+                        "- 'unsupported': For any other query type (hospitals, restaurants, etc.)\n\n"
+                        "Respond ONLY with the endpoint name from the list above. "
+                        "Do not include any explanation or extra text."
                     ),
                 },
                 {
                     "role": "user",
-                    "content": f"User query: {user_query}\nDetermine the appropriate action:",
+                    "content": f"User query: {user_query}\n\nWhich endpoint?",
                 },
             ],
-            max_tokens=50,
+            max_tokens=20,
         )
 
-        # Correct object-style access
+        # Get the action from LLM
         action = response.choices[0].message.content.strip().lower()
+        
+        # Debug: print what the LLM determined
+        print(f"DEBUG - User Query: {user_query}")
+        print(f"DEBUG - LLM Endpoint: {action}")
 
         # Await the address extraction
         address = await extract_address_from_query(user_query)
+        print(f"DEBUG - Extracted Address: {address}")
 
-        # Use the extracted address
-        if "school" in user_query:  # Example matching
+        # Route based on LLM's decision
+        if action == "schools":
             return await nearby_schools(AddressQuery(address=address))
-        elif "transit" in action or "bus" in action or "skytrain" in action:
+        elif action == "school_catchment":
+            return await school_catchment(AddressQuery(address=address))
+        elif action == "transit":
             return await nearest_transit(AddressQuery(address=address))
-        elif "park" in action or "trail" in action:
+        elif action == "parks":
             return await nearby_parks_and_centres(AddressQuery(address=address))
-        elif "assessment" in action:
+        elif action == "assessment":
             return await get_bc_assessment(AddressQuery(address=address))
-        # Implement other mappings as needed
         else:
-            return {"message": "Unable to determine action", "query": user_query}
+            return {
+                "message": f"Query type not supported yet. Currently available: schools, transit, parks, assessment value.",
+                "query": user_query,
+                "action_determined": action,
+                "address_extracted": address,
+                "hint": "Try asking about nearby schools, transit stations, parks, or property assessment value."
+            }
 
     except Exception as e:
         return {"error": str(e)}
